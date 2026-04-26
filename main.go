@@ -352,9 +352,15 @@ func main() {
 						req.Header.Set("Prefer", "resolution=ignore-duplicates")
 						
 						resp, err := http.DefaultClient.Do(req)
-						if err == nil && resp.StatusCode <= 299 {
+						if err != nil {
+							log.Printf("[SUPABASE ERROR] Network error: %v", err)
+						} else if resp.StatusCode <= 299 {
 							log.Printf("[SUPABASE] Permanently stored response & embeddings for Tenant %s", compID)
+						} else {
+							errorBody, _ := io.ReadAll(resp.Body)
+							log.Printf("[SUPABASE ERROR] Status: %d, Response: %s", resp.StatusCode, string(errorBody))
 						}
+						
 						if resp != nil {
 							resp.Body.Close()
 						}
