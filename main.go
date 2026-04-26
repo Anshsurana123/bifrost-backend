@@ -615,6 +615,7 @@ func (p *BifrostProxy) registerCacheHit(w http.ResponseWriter, payload []byte, h
 	// 1. Try Gemini Format
 	var geminiData struct {
 		UsageMetadata struct {
+			PromptTokenCount     float64 `json:"promptTokenCount"`
 			CandidatesTokenCount float64 `json:"candidatesTokenCount"`
 		} `json:"usageMetadata"`
 	}
@@ -622,16 +623,21 @@ func (p *BifrostProxy) registerCacheHit(w http.ResponseWriter, payload []byte, h
 	// 2. Try OpenAI / standard format
 	var openaiData struct {
 		Usage struct {
+			PromptTokens     float64 `json:"prompt_tokens"`
 			CompletionTokens float64 `json:"completion_tokens"`
 		} `json:"usage"`
 	}
 
-	if err := json.Unmarshal(payload, &geminiData); err == nil && geminiData.UsageMetadata.CandidatesTokenCount > 0 {
-		// Gemini 1.5 Flash Output Tokens Rate: ~$0.60 per 1M output tokens
-		savings = geminiData.UsageMetadata.CandidatesTokenCount * 0.00000060
-	} else if err := json.Unmarshal(payload, &openaiData); err == nil && openaiData.Usage.CompletionTokens > 0 {
-		// OpenAI GPT-4o Output Tokens Rate: ~$15.00 per 1M output tokens
-		savings = openaiData.Usage.CompletionTokens * 0.00001500
+	if err := json.Unmarshal(payload, &geminiData); err == nil && (geminiData.UsageMetadata.CandidatesTokenCount > 0 || geminiData.UsageMetadata.PromptTokenCount > 0) {
+		// Gemini 1.5 Flash Rate: $0.075/1M Input, $0.30/1M Output
+		inputSavings := geminiData.UsageMetadata.PromptTokenCount * 0.000000075
+		outputSavings := geminiData.UsageMetadata.CandidatesTokenCount * 0.00000030
+		savings = inputSavings + outputSavings
+	} else if err := json.Unmarshal(payload, &openaiData); err == nil && (openaiData.Usage.CompletionTokens > 0 || openaiData.Usage.PromptTokens > 0) {
+		// OpenAI GPT-4o Rate: $5.00/1M Input, $15.00/1M Output
+		inputSavings := openaiData.Usage.PromptTokens * 0.00000500
+		outputSavings := openaiData.Usage.CompletionTokens * 0.00001500
+		savings = inputSavings + outputSavings
 	}
 
 	metrics.mu.Lock()
