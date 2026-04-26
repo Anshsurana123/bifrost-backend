@@ -312,13 +312,11 @@ func main() {
 				resp.Body = io.NopCloser(bytes.NewBuffer(respBody))
 				resp.ContentLength = int64(len(respBody))
 
-				// Store in L1 Direct Hash Cache (Isolated by Company)
-				hash := sha256.Sum256(reqBody)
-				kvStore.Set("cache:direct:"+companyID+":"+hex.EncodeToString(hash[:]), respBody, 24*time.Hour)
-				log.Printf("[CACHE] Stored response for direct hash (Tenant: %s)", companyID)
-
-				// Store in L2 Semantic Cache (Asynchronously)
+				// Store in L1 Direct Hash Cache & L2 Semantic Cache
 				go func(rBody string, pBody []byte, compID string) {
+					hash := sha256.Sum256([]byte(rBody))
+					hashStr := hex.EncodeToString(hash[:])
+					
 					var reqObj struct {
 						Prompt string `json:"prompt"`
 					}
@@ -327,8 +325,42 @@ func main() {
 					if promptText == "" {
 						promptText = rBody
 					}
+					
 					emb, err := getEmbedding(promptText)
-					if err == nil && len(emb) > 0 {
+					if err != nil || len(emb) == 0 {
+						return
+					}
+
+					supabaseUrl := os.Getenv("SUPABASE_URL")
+					supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+					if supabaseUrl != "" && supabaseKey != "" {
+						urlStr := fmt.Sprintf("%s/rest/v1/bifrost_cache", supabaseUrl)
+						payload := map[string]interface{}{
+							"company_id":  compID,
+							"prompt_text": promptText,
+							"prompt_hash": hashStr,
+							"embedding":   emb,
+							"response":    string(pBody),
+						}
+						jsonPayload, _ := json.Marshal(payload)
+						
+						req, _ := http.NewRequest("POST", urlStr, bytes.NewBuffer(jsonPayload))
+						req.Header.Set("apikey", supabaseKey)
+						req.Header.Set("Authorization", "Bearer "+supabaseKey)
+						req.Header.Set("Content-Type", "application/json")
+						req.Header.Set("Prefer", "resolution=ignore-duplicates")
+						
+						resp, err := http.DefaultClient.Do(req)
+						if err == nil && resp.StatusCode <= 299 {
+							log.Printf("[SUPABASE] Permanently stored response & embeddings for Tenant %s", compID)
+						}
+						if resp != nil {
+							resp.Body.Close()
+						}
+					} else {
+						// Fallback local memory
+						kvStore.Set("cache:direct:"+compID+":"+hashStr, pBody, 24*time.Hour)
 						semanticMu.Lock()
 						semanticStore = append(semanticStore, SemanticEntry{
 							CompanyID: compID,
@@ -336,7 +368,7 @@ func main() {
 							Response:  pBody,
 						})
 						semanticMu.Unlock()
-						log.Printf("[CACHE] Semantic brain trained on new prompt (Tenant: %s)", compID)
+						log.Printf("[CACHE] Local semantic brain trained on new prompt (Tenant: %s)", compID)
 					}
 				}(string(reqBody), respBody, companyID)
 
@@ -569,16 +601,37 @@ func (p *BifrostProxy) checkSemanticCache(w http.ResponseWriter, body []byte, co
 		return false
 	}
 
-	// L1: Direct Hash (Isolated by Company)
 	hash := sha256.Sum256(body)
 	hashStr := hex.EncodeToString(hash[:])
-	cached, err := p.kvStore.GetBytes("cache:direct:" + companyID + ":" + hashStr)
-	if err == nil {
-		p.registerCacheHit(w, cached, "DIRECT")
-		return true
+
+	supabaseUrl := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+	// L1: Direct Hash via Supabase
+	if supabaseUrl != "" && supabaseKey != "" {
+		urlStr := fmt.Sprintf("%s/rest/v1/bifrost_cache?select=response&company_id=eq.%s&prompt_hash=eq.%s", supabaseUrl, companyID, hashStr)
+		req, _ := http.NewRequest("GET", urlStr, nil)
+		req.Header.Set("apikey", supabaseKey)
+		req.Header.Set("Authorization", "Bearer "+supabaseKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			var result []struct {
+				Response string `json:"response"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && len(result) > 0 {
+				p.registerCacheHit(w, []byte(result[0].Response), "DIRECT")
+				return true
+			}
+		}
+	} else {
+		// Fallback local memory L1
+		cached, err := p.kvStore.GetBytes("cache:direct:" + companyID + ":" + hashStr)
+		if err == nil {
+			p.registerCacheHit(w, cached, "DIRECT")
+			return true
+		}
 	}
 
-	// L2: Semantic Vector Match (Network bound)
 	var reqBody struct {
 		Prompt string `json:"prompt"`
 	}
@@ -593,15 +646,42 @@ func (p *BifrostProxy) checkSemanticCache(w http.ResponseWriter, body []byte, co
 		return false
 	}
 
-	semanticMu.RLock()
-	defer semanticMu.RUnlock()
-
-	for _, entry := range semanticStore {
-		// Strict Isolation: Only match against this specific company's vectors
-		if entry.CompanyID == companyID {
-			if cosineSimilarity(emb, entry.Embedding) > SemanticThreshold {
-				p.registerCacheHit(w, entry.Response, "SEMANTIC")
+	// L2: Semantic Match
+	if supabaseUrl != "" && supabaseKey != "" {
+		urlStr := fmt.Sprintf("%s/rest/v1/rpc/match_prompts", supabaseUrl)
+		payload := map[string]interface{}{
+			"query_embedding":   emb,
+			"match_threshold":   SemanticThreshold,
+			"match_count":       1,
+			"target_company_id": companyID,
+		}
+		jsonPayload, _ := json.Marshal(payload)
+		
+		req, _ := http.NewRequest("POST", urlStr, bytes.NewBuffer(jsonPayload))
+		req.Header.Set("apikey", supabaseKey)
+		req.Header.Set("Authorization", "Bearer "+supabaseKey)
+		req.Header.Set("Content-Type", "application/json")
+		
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			var result []struct {
+				Response string `json:"response"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && len(result) > 0 {
+				p.registerCacheHit(w, []byte(result[0].Response), "SEMANTIC")
 				return true
+			}
+		}
+	} else {
+		// Fallback local memory L2
+		semanticMu.RLock()
+		defer semanticMu.RUnlock()
+		for _, entry := range semanticStore {
+			if entry.CompanyID == companyID {
+				if cosineSimilarity(emb, entry.Embedding) > SemanticThreshold {
+					p.registerCacheHit(w, entry.Response, "SEMANTIC")
+					return true
+				}
 			}
 		}
 	}
