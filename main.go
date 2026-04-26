@@ -274,7 +274,33 @@ func main() {
 				virtualKey := pr.In.Header.Get("X-Bifrost-Key")
 				if virtualKey != "" {
 					realKey, err := kvStore.Get("key_map:" + virtualKey)
-					if err == nil {
+					if err != nil {
+						// Fallback to Supabase if Render restarted
+						supabaseUrl := os.Getenv("SUPABASE_URL")
+						supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+						if supabaseUrl != "" && supabaseKey != "" {
+							urlStr := fmt.Sprintf("%s/rest/v1/bifrost_keys?select=real_key,company_id,app_secret&virtual_key=eq.%s", supabaseUrl, virtualKey)
+							req, _ := http.NewRequest("GET", urlStr, nil)
+							req.Header.Set("apikey", supabaseKey)
+							req.Header.Set("Authorization", "Bearer "+supabaseKey)
+							if resp, err := http.DefaultClient.Do(req); err == nil && resp.StatusCode == 200 {
+								var result []struct {
+									RealKey   string `json:"real_key"`
+									CompanyID string `json:"company_id"`
+									AppSecret string `json:"app_secret"`
+								}
+								if json.NewDecoder(resp.Body).Decode(&result) == nil && len(result) > 0 {
+									realKey = result[0].RealKey
+									kvStore.Set("key_map:"+virtualKey, result[0].RealKey, 0)
+									kvStore.Set("key_company:"+virtualKey, result[0].CompanyID, 0)
+									kvStore.Set("app_secret:"+virtualKey, result[0].AppSecret, 0)
+								}
+								resp.Body.Close()
+							}
+						}
+					}
+					
+					if realKey != "" {
 						// Gemini authenticates via ?key= query parameter
 						q := pr.Out.URL.Query()
 						q.Set("key", realKey)
@@ -446,10 +472,36 @@ func (p *BifrostProxy) handleKeyGenerate(w http.ResponseWriter, r *http.Request)
 	rand.Read(randBytes)
 	appSecret := "sec-" + hex.EncodeToString(randBytes)
 
-	// Bind key to specific company
+	// Bind key to specific company in memory
 	p.kvStore.Set("key_map:"+virtualKey, req.RealKey, 0)
 	p.kvStore.Set("key_company:"+virtualKey, req.CompanyID, 0)
 	p.kvStore.Set("app_secret:"+virtualKey, appSecret, 0)
+
+	supabaseUrl := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+	if supabaseUrl != "" && supabaseKey != "" {
+		urlStr := fmt.Sprintf("%s/rest/v1/bifrost_keys", supabaseUrl)
+		payload := map[string]interface{}{
+			"virtual_key": virtualKey,
+			"company_id":  req.CompanyID,
+			"real_key":    req.RealKey,
+			"app_secret":  appSecret,
+		}
+		jsonPayload, _ := json.Marshal(payload)
+		
+		reqObj, _ := http.NewRequest("POST", urlStr, bytes.NewBuffer(jsonPayload))
+		reqObj.Header.Set("apikey", supabaseKey)
+		reqObj.Header.Set("Authorization", "Bearer "+supabaseKey)
+		reqObj.Header.Set("Content-Type", "application/json")
+		
+		resp, err := http.DefaultClient.Do(reqObj)
+		if err != nil {
+			log.Printf("[SUPABASE ERROR] Failed to save key: %v", err)
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
 
 	// Enable caching by default for new companies
 	if _, err := p.kvStore.Get("cache_enabled:" + req.CompanyID); err != nil {
@@ -762,7 +814,33 @@ func (p *BifrostProxy) validateIdentity(r *http.Request) (valid bool, quarantine
 
 	appSecret, err := p.kvStore.Get("app_secret:" + bifrostKey)
 	if err != nil {
-		appSecret = "default-app-secret-123"
+		// Attempt to lazily load from Supabase if not in memory
+		supabaseUrl := os.Getenv("SUPABASE_URL")
+		supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+		if supabaseUrl != "" && supabaseKey != "" {
+			urlStr := fmt.Sprintf("%s/rest/v1/bifrost_keys?select=real_key,company_id,app_secret&virtual_key=eq.%s", supabaseUrl, bifrostKey)
+			req, _ := http.NewRequest("GET", urlStr, nil)
+			req.Header.Set("apikey", supabaseKey)
+			req.Header.Set("Authorization", "Bearer "+supabaseKey)
+			if resp, err := http.DefaultClient.Do(req); err == nil && resp.StatusCode == 200 {
+				var result []struct {
+					RealKey   string `json:"real_key"`
+					CompanyID string `json:"company_id"`
+					AppSecret string `json:"app_secret"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&result) == nil && len(result) > 0 {
+					appSecret = result[0].AppSecret
+					p.kvStore.Set("key_map:"+bifrostKey, result[0].RealKey, 0)
+					p.kvStore.Set("key_company:"+bifrostKey, result[0].CompanyID, 0)
+					p.kvStore.Set("app_secret:"+bifrostKey, result[0].AppSecret, 0)
+				}
+				resp.Body.Close()
+			}
+		}
+
+		if appSecret == "" {
+			appSecret = "default-app-secret-123"
+		}
 	}
 
 	message := fmt.Sprintf("%s%s%s", deviceID, appSecret, timestampStr)
