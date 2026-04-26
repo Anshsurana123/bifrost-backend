@@ -610,12 +610,24 @@ func (p *BifrostProxy) checkSemanticCache(w http.ResponseWriter, body []byte, co
 }
 
 func (p *BifrostProxy) registerCacheHit(w http.ResponseWriter, payload []byte, hitType string) {
+	var respData struct {
+		UsageMetadata struct {
+			TotalTokenCount float64 `json:"totalTokenCount"`
+		} `json:"usageMetadata"`
+	}
+	
+	savings := SavingsPerCacheHit // Fallback if parsing fails
+	if err := json.Unmarshal(payload, &respData); err == nil && respData.UsageMetadata.TotalTokenCount > 0 {
+		// Gemini 1.5/2.5 Flash blended rate: ~$0.15 per 1 Million tokens
+		savings = respData.UsageMetadata.TotalTokenCount * 0.00000015
+	}
+
 	metrics.mu.Lock()
 	metrics.CacheHits++
-	metrics.TotalSavings += SavingsPerCacheHit
+	metrics.TotalSavings += savings
 	metrics.mu.Unlock()
 
-	log.Printf("[CACHE] stored responce used (%s)", hitType)
+	log.Printf("[CACHE] stored responce used (%s) - Saved: $%.6f", hitType, savings)
 
 	w.Header().Set("X-Bifrost-Cache", hitType)
 	w.Header().Set("Content-Type", "application/json")
