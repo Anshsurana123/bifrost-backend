@@ -354,6 +354,7 @@ func main() {
 					
 					emb, err := getEmbedding(promptText)
 					if err != nil || len(emb) == 0 {
+						log.Printf("[CACHE ERROR] Aborting cache storage. Semantic Brain embedding failed: %v", err)
 						return
 					}
 
@@ -621,12 +622,17 @@ func getEmbedding(text string) ([]float32, error) {
 	req, _ := http.NewRequest("POST", urlStr, bytes.NewBuffer(jsonPayload))
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		errorBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Gemini API Error %d: %s", resp.StatusCode, string(errorBody))
+	}
 
 	var result struct {
 		Embedding struct {
