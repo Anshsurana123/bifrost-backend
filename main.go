@@ -419,6 +419,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/metrics", wsHandler)
 	mux.HandleFunc("/api/keys/generate", proxy.handleKeyGenerate)
+	mux.HandleFunc("/api/keys/rotate", proxy.handleKeyRotate)
 	mux.HandleFunc("/api/settings/cache", proxy.handleSettings)
 	mux.HandleFunc("/mcp", proxy.handleMCP)
 	mux.HandleFunc("/", proxy.ServeHTTP)
@@ -515,6 +516,58 @@ func (p *BifrostProxy) handleKeyGenerate(w http.ResponseWriter, r *http.Request)
 		"app_secret":  appSecret,
 		"company_id":  req.CompanyID,
 	})
+}
+
+func (p *BifrostProxy) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		VirtualKey string `json:"virtual_key"`
+		NewRealKey string `json:"new_real_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	if req.VirtualKey == "" || req.NewRealKey == "" {
+		http.Error(w, `{"error":"virtual_key and new_real_key are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Update in-memory store
+	p.kvStore.Set("key_map:"+req.VirtualKey, req.NewRealKey, 0)
+	log.Printf("[KEY ROTATION] Virtual key %s rotated to new provider key", req.VirtualKey[:12]+"...")
+
+	// Update in Supabase
+	supabaseUrl := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+	if supabaseUrl != "" && supabaseKey != "" {
+		urlStr := fmt.Sprintf("%s/rest/v1/bifrost_keys?virtual_key=eq.%s", supabaseUrl, req.VirtualKey)
+		payload := map[string]interface{}{
+			"real_key": req.NewRealKey,
+		}
+		jsonPayload, _ := json.Marshal(payload)
+
+		reqObj, _ := http.NewRequest("PATCH", urlStr, bytes.NewBuffer(jsonPayload))
+		reqObj.Header.Set("apikey", supabaseKey)
+		reqObj.Header.Set("Authorization", "Bearer "+supabaseKey)
+		reqObj.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(reqObj)
+		if err != nil {
+			log.Printf("[SUPABASE ERROR] Failed to rotate key: %v", err)
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"rotated"}`))
 }
 
 func (p *BifrostProxy) handleSettings(w http.ResponseWriter, r *http.Request) {
